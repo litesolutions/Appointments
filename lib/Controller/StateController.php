@@ -69,11 +69,8 @@ class StateController extends Controller
                     $other_cal = "-1";
                     $main_cal = $this->utils->getMainCalId($this->userId, $pageId, $this->bc, $other_cal);
 
-                    $cms = $this->utils->getUserSettings($key, $this->userId);
+                    $ts_mode = $this->utils->getUserSettings($key, $this->userId)[BackendUtils::CLS_TS_MODE];
 
-                    $pgs[$pageId][BackendUtils::CLS_PRIVATE_PAGE] = $cms[BackendUtils::CLS_PRIVATE_PAGE];
-
-                    $ts_mode = $cms[BackendUtils::CLS_TS_MODE];
                     if ((($ts_mode === "0" || $ts_mode === "2") && $main_cal === "-1") ||
                         ($ts_mode === "1" && ($main_cal === "-1" || $other_cal === "-1"))
                     ) {
@@ -675,6 +672,23 @@ class StateController extends Controller
 
     private function makeFormComponent(&$obj, $index = 0) {
         $r = '';
+        $fields = [];
+        if (is_array($obj) && array_key_exists(0,$obj) && is_array($obj[0])) {
+            foreach ($obj as $ind => $field) {
+                $r = $this->makeFormField($field,$ind);
+                if ($r === '') {return $r;}
+                $fields[] = $r;
+                $obj[$ind]['name'] = $field['name'];
+                $r = '';
+            }
+            return implode('',$fields);
+        } else {
+            return $this->makeFormField($obj,$index);
+        }
+    }
+
+    private function makeFormField(&$obj, $index = 0) {
+        $r = '';
         if (!isset($obj['tag']) || !isset($obj['label'][2])) return $r;
         $obj['label'] = htmlspecialchars(trim($obj['label']), ENT_QUOTES, 'UTF-8');
         $tail = '';
@@ -743,12 +757,14 @@ class StateController extends Controller
             return false;
         }
 
+
         $d = $this->config->getUserValue($this->userId, $this->appName, "cnk");
         if ($d === "" || ((hexdec(substr($d, 0, 4)) >> 15) & 1) !== ((hexdec(substr($d, 4, 4)) >> 12) & 1)) {
             if (isset($va[BackendUtils::CLS_TMM_MORE_CALS]) && count($va[BackendUtils::CLS_TMM_MORE_CALS]) > 2) {
                 $va[BackendUtils::CLS_TMM_MORE_CALS] = array_slice($va[BackendUtils::CLS_TMM_MORE_CALS], 0, 2);
             }
         }
+
 
         if (isset($va[BackendUtils::CLS_TMM_SUBSCRIPTIONS_SYNC])) {
             // sync value must be one of the following
@@ -771,22 +787,6 @@ class StateController extends Controller
                 \OC::$server->getLogger()->error("can not set KEY_TMPL_INFO, setTemplateInfo failed");
                 return false;
             }
-        }
-
-        // ensure positive values for buffers and for now the "after" buffer must be the same as the "before" buffer because there is really no good way to deal with buffer overlap when bufferBefore != afterBuffer
-        if (isset($va[BackendUtils::CLS_BUFFER_BEFORE])){
-
-            if(isset($va[BackendUtils::CLS_TS_MODE]) && $va[BackendUtils::CLS_TS_MODE]===BackendUtils::CLS_TS_MODE_SIMPLE){
-                // in simple mode buffers must be 0
-                $va[BackendUtils::CLS_BUFFER_BEFORE]=0;
-            }
-            if($va[BackendUtils::CLS_BUFFER_BEFORE]<0){
-                $va[BackendUtils::CLS_BUFFER_BEFORE]=0;
-            }
-
-            $va[BackendUtils::CLS_BUFFER_AFTER]=$va[BackendUtils::CLS_BUFFER_BEFORE];
-        }else{
-            unset($va[BackendUtils::CLS_BUFFER_AFTER]);
         }
 
         $value = json_encode($va);
