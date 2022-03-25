@@ -803,8 +803,21 @@ class PageController extends Controller
 
         $post['_page_id'] = $pageId;
         $post['_embed'] = $embed === true ? "1" : "0";
+
+        // LITE-PATCH
+        // Solves: Allow multiple gaps at the same time
         // Update/create appointment data
-        $r = $this->bc->setAttendee($userId, $cal_id, $evt_uri, $post);
+        $cms = $this->utils->getUserSettings(BackendUtils::KEY_CLS, $userId);
+        $ts_mode = $cms[BackendUtils::CLS_TS_MODE];
+        if ($ts_mode === "1") { // external mode
+            // @see BCSabreImpl->queryRange()
+            $newcalId = $cal_id . chr(31) . $cms[BackendUtils::CLS_XTM_SRC_ID];
+            $r = $this->bc->setAttendee($userId, $newcalId, $evt_uri, $post);
+        }
+        else {
+            $r = $this->bc->setAttendee($userId, $cal_id, $evt_uri, $post);
+        }
+        // END LITE-PATCH
 
         if ($r > 0) {
             $this->logger->error("setAttendee error status: " . $r);

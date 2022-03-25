@@ -146,10 +146,16 @@ class AVLIntervalTree{
      * @param int $high
      * @return int
      */
-    function insert(&$tree,$low,$high){
+    // LITE-PATCH
+    // Solves: Allow multiple gaps at the same time
+    function insert(&$tree,$low,$high,$exclude_repetitions=true){
+    // END LITE-PATCH
         $path_top=&$tree;
 
-        while ($tree!==null && $tree->l!==$low){
+        // LITE-PATCH
+        // Solves: Allow multiple gaps at the same time
+        while ($tree!==null && ($tree->l!==$low || !$exclude_repetitions)){
+        // END LITE-PATCH
             if($tree->longer >= 0){
                 $path_top=&$tree;
             }
@@ -159,7 +165,10 @@ class AVLIntervalTree{
             $tree=&$tree->next[(int)($low>$tree->l)];
         }
 
-        if($tree!==null){
+        // LITE-PATCH
+        // Solves: Allow multiple gaps at the same time
+        if($tree!==null && $exclude_repetitions){
+        // END LITE-PATCH
             // already exists
             if($tree->h < $high){
                 $tree->h=$high;
@@ -180,24 +189,47 @@ class AVLIntervalTree{
     }
 
     /**
+     * LITE-PATCH
+     * Solves: Allow multiple gaps at the same time
+     *
      * @param AVLIntervalNode $tree
      * @param int $low
      * @param int $high
      * @return AVLIntervalNode|null null=no overlap
      */
-    static function lookUp($tree, $low, $high){
-        while ($tree!==null
-            && ($tree->l >= $high || $low >= $tree->h)) {
+    static function lookUp($tree, $low, $high, $exclude=[]){
+        do {
+            while ($tree!==null
+                //&& ($tree->l >= $high || $low >= $tree->h)) {
+                && ($tree->l != $low || $high != $tree->h)) {
 
-            // If left child of root is present and max of left child is
-            // greater than or equal to given interval, then i may
-            // overlap with an interval is left subtree
-            // Else interval can only overlap with right subtree
+                // If left child of root is present and max of left child is
+                // greater than or equal to given interval, then i may
+                // overlap with an interval is left subtree
+                // Else interval can only overlap with right subtree
 
-            // !($tree->next[0]!==null && $tree->next[0]->m >= $low );
-            $tree = $tree->next[
-                (int)($tree->next[0]===null || $tree->next[0]->m <= $low)];
+                // !($tree->next[0]!==null && $tree->next[0]->m >= $low );
+                //$tree = $tree->next[
+                //    (int)($tree->next[0]===null || $tree->next[0]->m <= $low)];
+
+                $tree_0 = self::lookUp($tree->next[0], $low, $high, $exclude);
+                $tree_1 = null;
+
+                if ($tree_0 === null) {
+                    $tree_1 = self::lookUp($tree->next[1], $low, $high, $exclude);
+                }
+
+                $tree = ($tree_0 !== null) ? $tree_0 : $tree_1;
+            }
+
+            if (in_array($tree, $exclude)) {
+                $tree = $tree->next[
+                    (int)($tree->next[0]===null || $tree->next[0]->m <= $low)];
+
+            }
         }
+        while ($tree!==null && (in_array($tree, $exclude) || $tree->l != $low || $high != $tree->h));
+
         return $tree;
     }
 }

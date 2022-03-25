@@ -126,8 +126,172 @@ class BCSabreImpl implements IBackendConnector
      * @return int 0=no events, 1=at least 1
      * @noinspection PhpDocMissingThrowsInspection
      */
-    private function checkRangeTR($start_ts, $end_ts, $calId, $utz, $userId) {
+    private function checkRangeTR($start_ts, $end_ts, $calIds, $utz, $userId) {
+        // parse calIds
+        $sp = strpos($calIds, chr(31));
+        if ($sp === false) {
+            $booked_tree = $this->checkRangeTR_getBookedTree($start_ts, $end_ts, $calIds, $utz, $userId);
 
+            // if $booked_tree is NOT null then there was a match(intersection)
+            return $booked_tree === null ? 0 : 1;
+        }
+
+        $srcId = substr($calIds, $sp + 1);
+        $dstId = substr($calIds, 0, $sp);
+
+        $booked_tree = $this->checkRangeTR_getBookedTree($start_ts, $end_ts, $dstId, $utz, $userId);
+
+        //$key = hex2bin($this->config->getAppValue($this->appName, 'hk'));
+        //$query_range = $this->queryRangeTR($calIds, $start, $end, $key, $userId);
+
+        $start = new \DateTime('@' . $start_ts, $utz);
+
+        // Because of floating timezones...
+        // 50400 = 14 hours
+        /** @noinspection PhpUnhandledExceptionInspection */
+        $dt = new \DateTime('@' . ($start_ts - 50400), $utz);
+        $r_start = $dt->format(self::TIME_FORMAT);
+        $dt->setTimestamp($end_ts + 50400);
+        $r_end = $dt->format(self::TIME_FORMAT);
+
+        $cls = $this->utils->getUserSettings(
+            BackendUtils::KEY_CLS, $userId);
+
+        $parser = new XmlService();
+        $parser->elementMap['{urn:ietf:params:xml:ns:caldav}calendar-query'] = 'Sabre\\CalDAV\\Xml\\Request\\CalendarQueryReport';
+        try {
+            $result = $parser->parse($this::makeTrDavReport($r_start, $r_end, $cls[BackendUtils::CLS_XTM_REQ_CAT]));
+        } catch (ParseException $e) {
+            $this->logger->error($e);
+            return -1;
+        }
+
+        // Get free/available spots
+        $urls = $this->backend->calendarQuery($srcId, $result->filters);
+        $objs = $this->backend->getMultipleCalendarObjects($srcId, $urls);
+
+        $used_tree = [];
+        foreach ($objs as $obj) {
+
+            $cd = $obj['calendardata'];
+
+            if (strpos($cd, "\r\nTRANSP:TRANSPARENT\r\n", 22) === false) {
+                // must be "Free" aka TRANSPARENT
+                continue;
+            }
+
+            /** @var \Sabre\VObject\Component\VCalendar $vo */
+            $vo = Reader::read($cd);
+
+            /** @var \Sabre\VObject\Component\VEvent $evt */
+            $evt = $vo->VEVENT;
+
+            if (!$evt->DTSTART->hasTime()
+                || (isset($evt->CLASS) && $evt->CLASS->getValue() !== 'PUBLIC')) {
+                $vo->destroy();
+                continue;
+            }
+
+            $ts_pref = 'U';
+            if ($evt->DTSTART->isFloating()) {
+                $vo->destroy();
+                continue;
+            }
+
+            $atl = ':';
+            if (isset($evt->SUMMARY)) {
+                $s = $evt->SUMMARY->getValue();
+                if ($s[0] === "_") {
+                    $atl .= str_replace(',', ' ', $s);
+                }
+            }
+
+            if (isset($evt->RRULE)) {
+
+                try {
+                    $it = new EventIterator($vo->getByUID($evt->UID->getValue()), null, $utz);
+                } catch (NoInstancesException $e) {
+                    // This event is recurring, but it doesn't have a single instance. We are skipping this event from the output entirely.
+                    continue;
+                }
+
+                $it->fastForward($start);
+                $skip_count = $it->key();
+            } else {
+                if (isset($evt->STATUS)
+                    && $evt->STATUS->getValue() === 'CANCELLED') {
+                    // check if CANCELLED early
+                    $vo->destroy();
+                    continue;
+                }
+                // TODO: reuse FakeIterator
+                $it = new FakeIterator($evt, $utz);
+                $skip_count = 0;
+            }
+
+            $c = 0;
+            while ($it->valid()) {
+
+                $c++;
+                if ($c > 128) break;
+
+                $_evt = $it->getEventObject();
+                if (isset($_evt->STATUS)
+                    && $_evt->STATUS->getValue() === 'CANCELLED') {
+                    $it->next();
+                    continue;
+                }
+
+                $s_ts = $it->getDtStart()->getTimestamp();
+
+                if ($s_ts >= $end_ts) {
+                    $it->next();
+                    break;
+                }
+
+                $e_ts = $it->getDtEnd()->getTimestamp();
+
+                if ($start_ts == $s_ts && $end_ts == $e_ts) {
+                    $tree = AVLIntervalTree::lookUp($booked_tree, $s_ts, $e_ts, $used_tree);
+                    if ($tree !== null) {
+                        $used_tree[] = $tree;
+                    }
+                    else {
+                        return 0;
+                    }
+                }
+                $it->next();
+            }
+
+            if ($skip_count > 14 && $cls[BackendUtils::CLS_XTM_PUSH_REC] === true) {
+                // Optimize recurrence
+                $it->rewind();
+                $skip_until = $skip_count - 7;
+                while ($it->valid() && $it->key() < $skip_until) {
+                    $it->next();
+                }
+                $this->utils->optimizeRecurrence($it->getDtStart(), $it->getDtEnd(), $skip_until, $vo);
+                $this->updateObject($srcId, $obj['uri'], $vo->serialize());
+            }
+            $vo->destroy();
+        }
+
+        return 1;
+    }
+
+    /**
+     * LITE-PATCH
+     * Solves: Allow multiple gaps at the same time
+     *
+     * @param int $start_ts UTC
+     * @param int $end_ts UTC
+     * @param string $calId
+     * @param \DateTimeZone $utz user's timezone
+     * @param string $userId
+     * @return int 0=no events, 1=at least 1
+     * @noinspection PhpDocMissingThrowsInspection
+     */
+    private function checkRangeTR_getBookedTree($start_ts, $end_ts, $calId, $utz, $userId) {
         $cls = $this->utils->getUserSettings(
             BackendUtils::KEY_CLS, $userId);
 
@@ -162,11 +326,7 @@ class BCSabreImpl implements IBackendConnector
 
         $end_ts--; // -1 second
 
-        $booked_tree = $this->buildBusyTree($userId, $cals, $result->filters, $start, $start_ts, $end_ts, true);
-
-        // if $booked_tree is NOT null then there was a match(intersection)
-        return $booked_tree === null ? 0 : 1;
-
+        return $this->buildBusyTree($userId, $cals, $result->filters, $start, $start_ts, $end_ts, false);
     }
 
     /**
@@ -232,6 +392,10 @@ class BCSabreImpl implements IBackendConnector
         // '_'ts_mode(1byte)ses_time(4bytes)dates(8bytes)uri(no extension)
         $ses_info = '_1' . pack("L", time());
 
+        // LITE-PATCH
+        // Solves: Allow multiple gaps at the same time
+        $used_tree = [];
+        // END LITE-PATCH
         $showET = $this->utils->getUserSettings(BackendUtils::KEY_PSN, $userId)[BackendUtils::PSN_END_TIME];
         foreach ($objs as $obj) {
 
@@ -313,13 +477,19 @@ class BCSabreImpl implements IBackendConnector
                 if ($s_ts > $start_ts) {
                     $e_ts = $it->getDtEnd()->getTimestamp();
 
-                    if (AVLIntervalTree::lookUp($booked_tree,
-                            $s_ts, $e_ts) === null) {
+                    // LITE-PATCH
+                    // Solves: Allow multiple gaps at the same time
+                    $tree = AVLIntervalTree::lookUp($booked_tree, $s_ts, $e_ts, $used_tree);
+                    if ($tree === null) {
 
                         $str_out .= $ts_pref . $s_ts
                             . ($showET ? ":" . $e_ts : "")
                             . ':' . $this->utils->encrypt($ses_info . pack("LL", $s_ts, $e_ts) . substr($obj['uri'], 0, -4), $key) . $atl . ',';
                     }
+                    else {
+                        $used_tree[] = $tree;
+                    }
+                    // END LITE-PATCH
                 }
                 $it->next();
             }
@@ -572,7 +742,10 @@ class BCSabreImpl implements IBackendConnector
                                     ], true));
                             }
 
-                            $itc->insert($busy_tree, $s_ts, $e_ts);
+                            // LITE-PATCH
+                            // Solves: Allow multiple gaps at the same time
+                            $itc->insert($busy_tree, $s_ts, $e_ts, false);
+                            // END LITE-PATCH
 
                             if ($returnAfterFirstMatch) {
                                 // we short circuit when this is called from checkRangeXxx() functions
@@ -976,7 +1149,18 @@ class BCSabreImpl implements IBackendConnector
     /**
      * @inheritDoc
      */
-    function setAttendee($userId, $calId, $uri, $info) {
+    function setAttendee($userId, $calIds, $uri, $info) {
+        // LITE-PATCH
+        // Solves: Allow multiple gaps at the same time
+        $sp = strpos($calIds, chr(31));
+        if ($sp === false) {
+            $calId = $calIds;
+        }
+        else {
+            $calId = substr($calIds, 0, $sp);
+            $srcId = substr($calIds, $sp + 1);
+        }
+        // END LITE-PATCH
 
         $pageId = $info['_page_id'];
 
@@ -1164,7 +1348,10 @@ class BCSabreImpl implements IBackendConnector
                 // for external and template modes we need to re-check the time range and update the lock_uid to "real" uid or delete the lock_uid if the time range is "taken"
 
                 if ($ts_mode === '1') {
-                    $trc = $this->checkRangeTR($info['ext_start'], $info['ext_end'], $calId, $utz, $userId);
+                    // LITE-PATCH
+                    // Solves: Allow multiple gaps at the same time
+                    $trc = $this->checkRangeTR($info['ext_start'], $info['ext_end'], $calIds, $utz, $userId);
+                    // END LITE-PATCH
                 } else {
                     // template mode
                     $dt->setTimestamp($info['tmpl_start_ts']);
